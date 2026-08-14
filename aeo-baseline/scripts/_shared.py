@@ -101,10 +101,20 @@ def extract_queries(response: dict) -> list:
     return queries
 
 
+VERTEX_REDIRECT_HOST = "vertexaisearch.cloud.google.com"
+_BARE_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$")
+
+
 def extract_sources(response: dict) -> list:
     """Extract grounding source URLs and titles from grounding chunks.
 
     Returns list of {"title": str, "uri": str} dicts, deduplicated by URI.
+
+    Gemini grounding wraps every source URL in a vertexaisearch.cloud.google.com
+    redirect and reports the real source domain in the chunk title. When that
+    happens, "uri" is rewritten to a real-domain URL so downstream domain
+    matching (brand citations, competitor share) sees the true source, and the
+    original wrapper is preserved as "redirect_uri".
     """
     sources = []
     seen = set()
@@ -114,9 +124,15 @@ def extract_sources(response: dict) -> list:
             web = chunk.get("web", {})
             uri = web.get("uri", "")
             title = web.get("title", "")
-            if uri and uri not in seen:
-                seen.add(uri)
-                sources.append({"title": title, "uri": uri})
+            if not uri or uri in seen:
+                continue
+            seen.add(uri)
+            source = {"title": title, "uri": uri}
+            title_domain = title.lower().strip()
+            if VERTEX_REDIRECT_HOST in uri and _BARE_DOMAIN_RE.match(title_domain):
+                source["uri"] = f"https://{title_domain}/"
+                source["redirect_uri"] = uri
+            sources.append(source)
     return sources
 
 

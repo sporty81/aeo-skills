@@ -32,9 +32,9 @@ from pathlib import Path
 # ── Shared imports ──────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _shared import (
-    call_gemini, call_gemini_vertex, extract_response_text, extract_queries, extract_sources,
+    call_gemini, extract_response_text, extract_queries, extract_sources,
     extract_domain, domain_matches, classify_intent, get_api_key,
-    DEFAULT_MODEL, DEFAULT_RUNS, DEFAULT_CONCURRENCY, VERTEX_DEFAULT_LOCATION,
+    DEFAULT_MODEL, DEFAULT_RUNS, DEFAULT_CONCURRENCY,
 )
 
 # ── Constants ───────────────────────────────────────────────────────────────
@@ -43,12 +43,8 @@ METHODOLOGY_VERSION = "aeo-v1"
 SCHEMA_VERSION = "aeo-evidence-v1"
 
 # Approximate cost per grounded Gemini Flash sample, USD.
-# Corrected 2026-08-17: the prior 0.0003 figure only priced output tokens
-# and ignored the Search Grounding fee, which dominates real cost. Measured
-# directly via OpenRouter's upstream_inference_cost passthrough (not a
-# markup) on a real grounded gemini-3-flash-preview call: $0.0588/sample.
-# Override via GEMINI_COST_PER_SAMPLE_USD env var if pricing changes.
-DEFAULT_COST_PER_SAMPLE_USD = 0.06
+# Override via GEMINI_COST_PER_SAMPLE_USD env var.
+DEFAULT_COST_PER_SAMPLE_USD = 0.0003
 
 # aeo-v1 scoring weights (per METHODOLOGY.md §4)
 SCORE_WEIGHTS = {
@@ -500,21 +496,18 @@ def run_one_prompt(
     prompt_text: str,
     intent: str | None,
     workspace: dict,
-    caller,
+    api_key: str,
+    model: str,
     runs: int,
     concurrency: int,
 ) -> dict:
-    """Run a prompt N times concurrently and return a fully-aggregated promptResult dict.
-
-    `caller` is a zero-config callable: caller(prompt_text) -> response dict.
-    Backend selection (AI Studio vs Vertex) is baked into the closure by main().
-    """
+    """Run a prompt N times concurrently and return a fully-aggregated promptResult dict."""
     print(f"\n▶ {prompt_id}: {prompt_text!r} × {runs} samples", file=sys.stderr)
     samples: list[dict] = []
     latencies: list[int] = []
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {pool.submit(_timed_call, prompt_text, caller): i for i in range(runs)}
+        futures = {pool.submit(_timed_call, prompt_text, api_key, model): i for i in range(runs)}
         for future in as_completed(futures):
             sample_idx = futures[future]
             try:
@@ -555,39 +548,18 @@ def run_one_prompt(
     return result
 
 
-def _timed_call(prompt: str, caller) -> tuple[dict, int]:
-    """Wrap a backend caller to also return latency in ms."""
+def _timed_call(prompt: str, api_key: str, model: str) -> tuple[dict, int]:
+    """Wrap call_gemini to also return latency in ms."""
     t0 = time.time()
-    resp = caller(prompt)
+    resp = call_gemini(prompt, api_key, model)
     latency_ms = int((time.time() - t0) * 1000)
     return resp, latency_ms
 
 
 # ── Doctor + Config ─────────────────────────────────────────────────────────
 
-def doctor(backend: str = "aistudio", vertex_project: str | None = None, vertex_location: str = VERTEX_DEFAULT_LOCATION) -> int:
-    """Verify API access works with a 1-token grounded probe. No storage; no extraction."""
-    if backend == "vertex":
-        if not vertex_project:
-            print("✗ --backend vertex requires --vertex-project (or a providers[] entry in config)", file=sys.stderr)
-            return 1
-        print(f"  Minting Vertex AI access token via ADC (project={vertex_project}, location={vertex_location})...")
-        try:
-            from _shared import get_vertex_access_token
-            token = get_vertex_access_token()
-            print(f"✓ ADC access token minted (length {len(token)})")
-        except Exception as e:
-            print(f"✗ ADC auth failed: {e}", file=sys.stderr)
-            print("  Run `gcloud auth application-default login` first.", file=sys.stderr)
-            return 1
-        print("  Sending 1-token grounded probe to Vertex AI...")
-        resp = call_gemini_vertex("ping", vertex_project, DEFAULT_MODEL, vertex_location)
-        if "error" in resp:
-            print(f"✗ Vertex AI error: {resp['error']}", file=sys.stderr)
-            return 1
-        print(f"✓ Vertex AI responded successfully (model: {DEFAULT_MODEL})")
-        return 0
-
+def doctor() -> int:
+    """Verify GEMINI_API_KEY works with a 1-token probe. No storage; no extraction."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("✗ GEMINI_API_KEY env var not set", file=sys.stderr)
@@ -662,10 +634,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--doctor", action="store_true", help="Verify API key and exit; no measurements")
     p.add_argument("--estimate-cost", action="store_true", help="Print projected cost and exit; no API calls")
     p.add_argument("--yes", "-y", action="store_true", help="Skip cost-confirmation prompt")
-    p.add_argument("--resume", default=None, help="Path to a partial/interrupted evidence file; skip prompts already completed there and keep writing into it")
-    p.add_argument("--backend", choices=["aistudio", "vertex"], default=None, help="API backend (default: from config providers[], else 'aistudio'). AI Studio caps Search Grounding at 1,500 requests/day regardless of billing tier; Vertex scales to 1,000,000/day but needs `gcloud auth application-default login` first.")
-    p.add_argument("--vertex-project", default=None, help="Google Cloud project ID for --backend vertex (default: from config)")
-    p.add_argument("--vertex-location", default=None, help=f"Vertex location for --backend vertex (default: from config or {VERTEX_DEFAULT_LOCATION!r})")
     return p.parse_args(argv)
 
 
@@ -673,11 +641,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     if args.doctor:
-        return doctor(
-            backend=args.backend or "aistudio",
-            vertex_project=args.vertex_project,
-            vertex_location=args.vertex_location or VERTEX_DEFAULT_LOCATION,
-        )
+        return doctor()
 
     # Load config (unless running an ad-hoc one-prompt mode that doesn't need workspace).
     # For --prompt mode, still load config if present so we get workspace context.
@@ -723,71 +687,26 @@ def main(argv: list[str] | None = None) -> int:
             print("Aborted.")
             return 1
 
-    # Backend selection: AI Studio (API key, 1,500/day grounding cap) or
-    # Vertex (ADC auth, scales to 1,000,000/day grounding). Config can name
-    # either/both backends in providers[]; CLI flags override.
-    providers = {p.get("name"): p for p in (config or {}).get("providers", [])}
-    backend = args.backend or ("vertex" if "vertex" in providers and "gemini" not in providers else "aistudio")
+    # API key check
+    api_key = get_api_key()
 
-    if backend == "vertex":
-        vertex_cfg = providers.get("vertex", {})
-        vertex_project = args.vertex_project or vertex_cfg.get("project_id")
-        vertex_location = args.vertex_location or vertex_cfg.get("location", VERTEX_DEFAULT_LOCATION)
-        if not vertex_project:
-            print("✗ --backend vertex requires a project ID: pass --vertex-project or add a providers[] entry with name='vertex' and project_id", file=sys.stderr)
-            return 2
-        vertex_model = vertex_cfg.get("model", model)
+    # Build run metadata
+    started_at = datetime.now(timezone.utc)
+    run_id = "run_" + started_at.strftime("%Y-%m-%dT%H-%M-%SZ")
+    run_meta = {
+        "run_id": run_id,
+        "timestamp": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "provider": "gemini",
+        "model": model,
+        "samples": runs,
+        "methodology_version": METHODOLOGY_VERSION,
+        "estimated_cost_usd": round(est_cost, 6),
+    }
 
-        def caller(prompt_text: str) -> dict:
-            return call_gemini_vertex(prompt_text, vertex_project, vertex_model, vertex_location)
-
-        print(f"Backend: Vertex AI (project={vertex_project}, location={vertex_location})", file=sys.stderr)
-    else:
-        api_key = get_api_key()
-
-        def caller(prompt_text: str) -> dict:
-            return call_gemini(prompt_text, api_key, model)
-
-    # Build run metadata. When resuming, reuse the original run_id and
-    # output_dir so we keep filling in the same evidence file rather than
-    # starting a new one, and preserve prompt_results already completed.
-    prompt_results: list[dict] = []
-    resume_path = None
-    if args.resume:
-        resume_path = args.resume
-        with open(resume_path) as f:
-            prior = json.load(f)
-        run_id = prior["run"]["run_id"]
-        run_meta = prior["run"]
-        run_meta["estimated_cost_usd"] = round(est_cost, 6)
-        output_dir = os.path.dirname(os.path.abspath(resume_path))
-        prompt_results = prior.get("prompts", [])
-        done_ids = {
-            r["prompt_id"] for r in prompt_results
-            if r.get("successful_samples", 0) + r.get("failed_samples", 0) >= runs
-        }
-        before = len(prompts)
-        prompts = [p for p in prompts if p["prompt_id"] not in done_ids]
-        print(f"↻ Resuming {resume_path}: {len(done_ids)} prompt(s) already complete, {len(prompts)} of {before} remaining", file=sys.stderr)
-    else:
-        started_at = datetime.now(timezone.utc)
-        run_id = "run_" + started_at.strftime("%Y-%m-%dT%H-%M-%SZ")
-        run_meta = {
-            "run_id": run_id,
-            "timestamp": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "provider": "gemini",
-            "model": model,
-            "samples": runs,
-            "methodology_version": METHODOLOGY_VERSION,
-            "estimated_cost_usd": round(est_cost, 6),
-        }
-
-    # Run every remaining prompt, saving progress after each one so a kill,
-    # crash, or quota exhaustion partway through never loses completed work.
+    # Run every prompt
+    prompt_results = []
     t_start = time.time()
     latencies_all: list[int] = []
-    for s in (samp for r in prompt_results for samp in r.get("samples", []) if "latency_ms" in samp):
-        latencies_all.append(s["latency_ms"])
     for p in prompts:
         intent = p.get("intent")
         # If config didn't provide intent, classify from prompt text
@@ -798,7 +717,8 @@ def main(argv: list[str] | None = None) -> int:
             prompt_text=p["text"],
             intent=intent,
             workspace=workspace,
-            caller=caller,
+            api_key=api_key,
+            model=model,
             runs=runs,
             concurrency=concurrency,
         )
@@ -806,10 +726,6 @@ def main(argv: list[str] | None = None) -> int:
             if "latency_ms" in s:
                 latencies_all.append(s["latency_ms"])
         prompt_results.append(result)
-
-        # Incremental save: write what we have so far after every prompt.
-        interim_evidence = build_evidence(workspace, run_meta, prompt_results)
-        write_evidence(interim_evidence, output_dir, run_id)
 
     elapsed = time.time() - t_start
     if latencies_all:

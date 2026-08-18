@@ -41,11 +41,11 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["name", "model", "api_key_env"],
+        "required": ["name", "model"],
         "properties": {
           "name": {
             "type": "string",
-            "enum": ["gemini", "openai", "anthropic", "perplexity"]
+            "enum": ["gemini", "openai", "anthropic", "perplexity", "vertex"]
           },
           "model": {
             "type": "string",
@@ -53,16 +53,33 @@
           },
           "api_key_env": {
             "type": "string",
-            "description": "Environment variable holding the API key (e.g. GEMINI_API_KEY)",
+            "description": "Environment variable holding the API key (e.g. GEMINI_API_KEY). Not used by the vertex provider, which authenticates via Application Default Credentials instead.",
             "pattern": "^[A-Z][A-Z0-9_]*$"
           },
           "grounding": {
             "type": "boolean",
             "default": true,
             "description": "Enable web grounding when supported by the provider"
+          },
+          "project_id": {
+            "type": "string",
+            "description": "Google Cloud project ID (vertex provider only). Vertex's Search Grounding quota (up to 1,000,000/day) is separate from and much larger than the gemini provider's fixed 1,500/day cap on the AI Studio / Generative Language API, regardless of billing tier."
+          },
+          "location": {
+            "type": "string",
+            "description": "Vertex AI location, e.g. 'global' (vertex provider only). Preview models are typically only available at 'global', not regional endpoints."
           }
         },
-        "additionalProperties": false
+        "additionalProperties": false,
+        "if": {
+          "properties": {"name": {"const": "vertex"}}
+        },
+        "then": {
+          "required": ["name", "model", "project_id"]
+        },
+        "else": {
+          "required": ["name", "model", "api_key_env"]
+        }
       }
     },
     "prompts": {

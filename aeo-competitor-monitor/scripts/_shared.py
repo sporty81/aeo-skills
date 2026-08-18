@@ -16,6 +16,7 @@ Import from any script:
 
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -29,8 +30,72 @@ from urllib.parse import urlparse
 DEFAULT_MODEL = "gemini-3-flash-preview"
 DEFAULT_RUNS = 20
 DEFAULT_CONCURRENCY = 5
-MAX_RETRIES = 5
+MAX_RETRIES = 8
 API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+VERTEX_API_BASE = "https://aiplatform.googleapis.com/v1"
+VERTEX_DEFAULT_LOCATION = "global"
+OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+
+
+# ── Vertex AI Auth (Application Default Credentials) ───────────────────────
+#
+# Vertex AI's Grounding with Google Search is billed and rate-limited
+# separately from the AI Studio / Generative Language API (which caps
+# Search Grounding at a fixed 1,500 requests/day regardless of billing
+# tier). Vertex scales to 1,000,000 grounding queries/day. Auth here uses
+# the standard `gcloud auth application-default login` ADC file directly
+# (stdlib-only refresh-token exchange) rather than shelling out to `gcloud`
+# per call, which would add subprocess overhead and a hard runtime
+# dependency on the CLI being installed and on PATH.
+
+_vertex_token_cache: dict = {"token": None, "expiry": 0.0}
+
+
+def _default_adc_path() -> str:
+    override = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if override:
+        return override
+    return os.path.expanduser("~/.config/gcloud/application_default_credentials.json")
+
+
+def get_vertex_access_token(adc_path: str | None = None) -> str:
+    """Return a live OAuth2 access token for Vertex AI calls.
+
+    Reads the `authorized_user`-type ADC JSON written by
+    `gcloud auth application-default login` and exchanges the refresh
+    token for a fresh access token via Google's OAuth endpoint. Cached
+    in-process; only re-mints when the cached token is within 2 minutes
+    of expiry (tokens are typically valid ~60 minutes).
+    """
+    now = time.time()
+    if _vertex_token_cache["token"] and now < _vertex_token_cache["expiry"] - 120:
+        return _vertex_token_cache["token"]
+
+    path = adc_path or _default_adc_path()
+    with open(path) as f:
+        creds = json.load(f)
+    if creds.get("type") != "authorized_user":
+        raise RuntimeError(
+            f"Unsupported ADC credential type {creds.get('type')!r} at {path}; "
+            "expected 'authorized_user' (run `gcloud auth application-default login`)"
+        )
+
+    payload = json.dumps({
+        "client_id": creds["client_id"],
+        "client_secret": creds["client_secret"],
+        "refresh_token": creds["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode()
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL, data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.loads(resp.read())
+
+    _vertex_token_cache["token"] = result["access_token"]
+    _vertex_token_cache["expiry"] = now + result.get("expires_in", 3600)
+    return _vertex_token_cache["token"]
 
 
 # ── API Key ─────────────────────────────────────────────────────────────────
@@ -46,37 +111,84 @@ def get_api_key() -> str:
 
 # ── Gemini API ──────────────────────────────────────────────────────────────
 
-def call_gemini(prompt: str, api_key: str, model: str = DEFAULT_MODEL) -> dict:
-    """Call Gemini API with Google Search grounding.
+def _call_with_retries(build_request) -> dict:
+    """Shared retry/backoff loop for both the AI Studio and Vertex backends.
 
-    Retries with exponential backoff on transient errors and 429 rate limits.
-    Returns parsed JSON response dict, or {"error": "..."} on failure.
+    `build_request` is a zero-arg callable returning a fresh
+    urllib.request.Request — rebuilt on every attempt so a Vertex bearer
+    token minted mid-retry-loop is never stale.
     """
-    url = f"{API_BASE}/models/{model}:generateContent?key={api_key}"
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-    }).encode()
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-
     for attempt in range(MAX_RETRIES):
         try:
+            req = build_request()
             with urllib.request.urlopen(req, timeout=180) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < MAX_RETRIES - 1:
-                wait = (2 ** attempt) + 1
-                print(f"    Rate limited, waiting {wait}s...", file=sys.stderr)
+                # Rate-limit windows are typically ~60s; a short exponential
+                # backoff (the old 2/3/5/9s schedule) never outlasts a
+                # sustained per-minute cap under concurrent load. Cap at 60s
+                # with jitter so concurrent workers don't retry in lockstep.
+                wait = min(5 * (2 ** attempt), 60) + random.uniform(0, 2)
+                print(f"    Rate limited, waiting {wait:.1f}s...", file=sys.stderr)
                 time.sleep(wait)
             elif attempt < MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(min(2 ** attempt, 30))
             else:
                 return {"error": f"HTTP {e.code}: {e.reason}"}
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             if attempt < MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(min(2 ** attempt, 30))
             else:
                 return {"error": str(e)}
+
+
+def _grounded_payload(prompt: str) -> bytes:
+    # "role" is optional on the AI Studio (Generative Language API) endpoint,
+    # which defaults it silently, but Vertex AI's stricter validation
+    # rejects a content entry with no role: 400 "Please use a valid role:
+    # user, model." Explicit role is accepted by both, so set it always.
+    return json.dumps({
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+    }).encode()
+
+
+def call_gemini(prompt: str, api_key: str, model: str = DEFAULT_MODEL) -> dict:
+    """Call the AI Studio (Generative Language API) endpoint with Google Search grounding.
+
+    NOTE: this endpoint caps Search Grounding at a fixed 1,500 requests/day
+    per project regardless of billing tier. For higher-volume workspaces,
+    use call_gemini_vertex instead (same request/response shape, scales to
+    1,000,000 grounding queries/day).
+
+    Retries with exponential backoff on transient errors and 429 rate limits.
+    Returns parsed JSON response dict, or {"error": "..."} on failure.
+    """
+    def build():
+        url = f"{API_BASE}/models/{model}:generateContent?key={api_key}"
+        return urllib.request.Request(url, data=_grounded_payload(prompt), headers={"Content-Type": "application/json"})
+    return _call_with_retries(build)
+
+
+def call_gemini_vertex(prompt: str, project_id: str, model: str = DEFAULT_MODEL, location: str = VERTEX_DEFAULT_LOCATION) -> dict:
+    """Call Gemini via Vertex AI with Google Search grounding.
+
+    Authenticates via Application Default Credentials (see
+    get_vertex_access_token) rather than an API key. Response shape is
+    identical to call_gemini's (candidates[].content.parts[].text,
+    groundingMetadata.webSearchQueries, groundingMetadata.groundingChunks),
+    so extract_response_text / extract_queries / extract_sources work
+    unchanged on either backend's output.
+    """
+    def build():
+        token = get_vertex_access_token()
+        url = f"{VERTEX_API_BASE}/projects/{project_id}/locations/{location}/publishers/google/models/{model}:generateContent"
+        return urllib.request.Request(
+            url, data=_grounded_payload(prompt),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+        )
+    return _call_with_retries(build)
 
 
 # ── Response Extraction ────────────────────────────────────────────────────
